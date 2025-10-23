@@ -269,3 +269,51 @@ compile_template(char *template, const template_variable *variables,
     _compile_template(templ);
     return templ;
 }
+
+/* Nginx pool-aware version of apply_template */
+char *
+apply_template_nginx(compiled_template *template_cmpl, ngx_http_request_t *r,
+                     void *data)
+{
+    if (!template_cmpl || !r) {
+        return NULL;
+    }
+
+    ngx_pool_t *pool = r->pool;
+    size_t template_len = ngx_strlen(template_cmpl->compiled_template_str);
+    char *result = ngx_pnalloc(pool, template_len + 1);
+
+    if (!result) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "Failed to allocate memory for template result");
+        return NULL;
+    }
+
+    ngx_cpystrn((u_char *)result, (u_char *)template_cmpl->compiled_template_str, 
+                template_len + 1);
+
+    unsigned int i;
+    for (i = 0; i < template_cmpl->variable_occurances->nelts; i++) {
+        variable_occurance *occ =
+            ((variable_occurance **)
+                 template_cmpl->variable_occurances->elts)[i];
+        if (!occ->http_hdr) {
+            const char *op = occ->variable->operation(r, data);
+            if (op) {
+                size_t len = ngx_strlen(op);
+                size_t copy_len = (occ->variable->len < len) ? occ->variable->len : len;
+                ngx_memcpy(result + occ->pos, op, copy_len);
+            }
+        } else {
+            http_hdr_coccurance_ctx ctx = {template_cmpl->template, occ};
+            const char *op = occ->variable->operation(r, &ctx);
+            if (op) {
+                size_t len = ngx_strlen(op);
+                size_t copy_len = (occ->variable->len < len) ? occ->variable->len : len;
+                ngx_memcpy(result + occ->pos, op, copy_len);
+            }
+        }
+    }
+    _remove_placeholder_chars(result);
+    return result;
+}

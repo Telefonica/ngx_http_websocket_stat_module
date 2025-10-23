@@ -48,4 +48,7 @@ compiled_template *compile_template(char *template,
                                     ngx_pool_t *pool);
 char *apply_template(compiled_template *template_cmpl, ngx_http_request_t *r,
                      void *data);
+/* New nginx-pool aware version */
+char *apply_template_nginx(compiled_template *template_cmpl, ngx_http_request_t *r,
+                          void *data);
 #endif
