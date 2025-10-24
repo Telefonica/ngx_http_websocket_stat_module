@@ -5,10 +5,6 @@
 #include <ngx_core.h>
 #include <ngx_http.h>
 
-#include <openssl/bio.h>
-#include <openssl/evp.h>
-#include <openssl/sha.h>
-
 #define UID_LENGTH 32
 #define KEY_SIZE 24
 #define ACCEPT_SIZE 28
@@ -19,9 +15,10 @@ char const *const kWsKey = "Sec-WebSocket-Key";
 
 typedef struct {
     time_t ws_conn_start_time;
-    ngx_frame_counter_t frame_counter;
+    ngx_frame_counter_t frame_counter_in;   /* Per-connection frame counter for incoming */
+    ngx_frame_counter_t frame_counter_out;  /* Per-connection frame counter for outgoing */
     ngx_str_t connection_id;
-
+    ngx_uint_t active_connections;
 } ngx_http_websocket_stat_ctx;
 
 typedef struct {
@@ -33,8 +30,9 @@ typedef struct {
 ngx_http_websocket_stat_statistic_t frames_in;
 ngx_http_websocket_stat_statistic_t frames_out;
 
-ngx_frame_counter_t frame_counter_in;
-ngx_frame_counter_t frame_counter_out;
+/* Global frame counters removed - now per-connection in ctx */
+/* ngx_frame_counter_t frame_counter_in;  -- REMOVED */
+/* ngx_frame_counter_t frame_counter_out; -- REMOVED */
 
 ngx_http_websocket_stat_ctx *stat_counter;
 typedef struct {
@@ -43,6 +41,8 @@ typedef struct {
 
 } template_ctx_s;
 
+/* Function declarations */
+static ngx_http_websocket_stat_ctx *ngx_http_websocket_get_ctx(ngx_http_request_t *r);
 static char *ngx_http_websocket_stat(ngx_conf_t *cf, ngx_command_t *cmd,
                                      void *conf);
 static char *ngx_http_websocket_max_conn_setup(ngx_conf_t *cf,
@@ -68,23 +68,22 @@ char CARET_RETURN = '\n';
 ngx_log_t *ws_log = NULL;
 const char *UNKNOWN_VAR = "???";
 
-static void
-Base64Encode(unsigned char *hash, int hash_len, char *buffer, int len)
+static inline void
+ngx_websocket_base64_encode(ngx_pool_t *pool, u_char *src, size_t src_len, 
+                           u_char *dst, size_t dst_len)
 {
-    BIO *b64, *mem;
-    b64 = BIO_new(BIO_f_base64());
-    BIO_set_flags(b64, BIO_FLAGS_BASE64_NO_NL);
-    mem = BIO_new(BIO_s_mem());
-    BIO_push(b64, mem);
-    BIO_set_flags(b64, BIO_FLAGS_BASE64_NO_NL);
-    BIO_write(b64, hash, hash_len);
-    if (BIO_flush(b64) != 1) {
-        printf("Error performing base64 encoding");
+    ngx_str_t source, encoded;
+
+    source.data = src;
+    source.len = src_len;
+    encoded.data = dst;
+
+    ngx_encode_base64(&encoded, &source);
+
+    /* Ensure null termination if there's space */
+    if (dst_len > encoded.len) {
+        dst[encoded.len] = '\0';
     }
-    char *data;
-    BIO_get_mem_data(mem, &data);
-    memcpy(buffer, data, len);
-    BIO_free_all(b64);
 }
 
 void
@@ -99,10 +98,12 @@ websocket_log(char *str)
 void
 ws_do_log(compiled_template *template, ngx_http_request_t *r, void *ctx)
 {
-    if (ws_log) {
-        char *log_line = apply_template(template, r, ctx);
-        websocket_log(log_line);
-        free(log_line);
+    if (ws_log && template && r) {
+        char *log_line = apply_template_nginx(template, r, ctx);
+        if (log_line) {
+            websocket_log(log_line);
+            /* No need to free - memory managed by nginx pool */
+        }
     }
 }
 
@@ -292,6 +293,37 @@ ngx_http_ws_logfile(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 typedef ssize_t (*send_func)(ngx_connection_t *c, u_char *buf, size_t size);
 send_func orig_recv, orig_send;
 
+/* Helper function to get or create websocket context for the connection */
+static ngx_http_websocket_stat_ctx *
+ngx_http_websocket_get_ctx(ngx_http_request_t *r)
+{
+    ngx_http_websocket_stat_ctx *ctx;
+
+    ctx = ngx_http_get_module_ctx(r, ngx_http_websocket_stat_module);
+    if (ctx == NULL) {
+        ctx = ngx_pcalloc(r->pool, sizeof(ngx_http_websocket_stat_ctx));
+        if (ctx == NULL) {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                          "Failed to allocate websocket context");
+            return NULL;
+        }
+
+        /* Initialize the context */
+        ctx->ws_conn_start_time = ngx_time();
+        ngx_memzero(&ctx->frame_counter_in, sizeof(ngx_frame_counter_t));
+        ngx_memzero(&ctx->frame_counter_out, sizeof(ngx_frame_counter_t));
+        ctx->active_connections = 0;
+
+        /* Set the context in the request */
+        ngx_http_set_ctx(r, ctx, ngx_http_websocket_stat_module);
+
+        /* Increment active connections counter */
+        ngx_atomic_fetch_add(ngx_websocket_stat_active, 1);
+    }
+
+    return ctx;
+}
+
 static int
 check_ws_age(time_t conn_start_time, ngx_http_request_t *r)
 {
@@ -316,8 +348,8 @@ my_send(ngx_connection_t *c, u_char *buf, size_t size)
     ngx_atomic_fetch_add(frame_counter->total_size, sz);
     ngx_http_request_t *r = c->data;
 
-    ctx = ngx_http_get_module_ctx(r, ngx_http_websocket_stat_module);
-    if (check_ws_age(ctx->ws_conn_start_time, r) != NGX_OK) {
+    ctx = ngx_http_websocket_get_ctx(r);
+    if (ctx == NULL || check_ws_age(ctx->ws_conn_start_time, r) != NGX_OK) {
         return NGX_ERROR;
     }
     template_ctx_s template_ctx;
@@ -325,10 +357,10 @@ my_send(ngx_connection_t *c, u_char *buf, size_t size)
     template_ctx.ws_ctx = ctx;
     while (sz > 0) {
         if (frame_counter_process_message(&buffer, &sz,
-                                          &(ctx->frame_counter))) {
+                                          &(ctx->frame_counter_out))) {
             ngx_atomic_fetch_add(frame_counter->frames, 1);
             ngx_atomic_fetch_add(frame_counter->total_payload_size,
-                                 ctx->frame_counter.current_payload_size);
+                                 ctx->frame_counter_out.current_payload_size);
             ws_do_log(log_template, r, &template_ctx);
         }
     }
@@ -356,8 +388,8 @@ my_recv(ngx_connection_t *c, u_char *buf, size_t size)
     ssize_t sz = n;
     ngx_http_websocket_stat_statistic_t *frame_counter = &frames_in;
     ngx_http_request_t *r = c->data;
-    ctx = ngx_http_get_module_ctx(r, ngx_http_websocket_stat_module);
-    if (check_ws_age(ctx->ws_conn_start_time, r) != NGX_OK) {
+    ctx = ngx_http_websocket_get_ctx(r);
+    if (ctx == NULL || check_ws_age(ctx->ws_conn_start_time, r) != NGX_OK) {
         return NGX_ERROR;
     }
     ngx_atomic_fetch_add(frame_counter->total_size, n);
@@ -365,11 +397,11 @@ my_recv(ngx_connection_t *c, u_char *buf, size_t size)
     template_ctx.from_client = 1;
     template_ctx.ws_ctx = ctx;
     while (sz > 0) {
-        if (frame_counter_process_message(&buf, &sz, &ctx->frame_counter)) {
+        if (frame_counter_process_message(&buf, &sz, &ctx->frame_counter_in)) {
 
             ngx_atomic_fetch_add(frame_counter->frames, 1);
             ngx_atomic_fetch_add(frame_counter->total_payload_size,
-                                 ctx->frame_counter.current_payload_size);
+                                 ctx->frame_counter_in.current_payload_size);
             ws_do_log(log_template, r, &template_ctx);
         }
     }
@@ -431,9 +463,18 @@ const char *
 ws_packet_type(ngx_http_request_t *r, void *data)
 {
     template_ctx_s *ctx = data;
-    ngx_frame_counter_t *frame_cntr = &(ctx->ws_ctx->frame_counter);
-    if (!ctx || !frame_cntr)
+    ngx_frame_counter_t *frame_cntr;
+
+    if (!ctx || !ctx->ws_ctx)
         return UNKNOWN_VAR;
+
+    /* Use appropriate frame counter based on direction */
+    if (ctx->from_client) {
+        frame_cntr = &(ctx->ws_ctx->frame_counter_in);
+    } else {
+        frame_cntr = &(ctx->ws_ctx->frame_counter_out);
+    }
+
     sprintf(buff, "%d", frame_cntr->current_frame_type);
     return buff;
 }
@@ -442,11 +483,20 @@ const char *
 ws_packet_size(ngx_http_request_t *r, void *data)
 {
     template_ctx_s *ctx = data;
-    ngx_frame_counter_t *frame_cntr = &ctx->ws_ctx->frame_counter;
-    if (!ctx || !frame_cntr)
+    ngx_frame_counter_t *frame_cntr;
+
+    if (!ctx || !ctx->ws_ctx)
         return UNKNOWN_VAR;
+
+    /* Use appropriate frame counter based on direction */
+    if (ctx->from_client) {
+        frame_cntr = &(ctx->ws_ctx->frame_counter_in);
+    } else {
+        frame_cntr = &(ctx->ws_ctx->frame_counter_out);
+    }
+
     sprintf(buff, "%lu", frame_cntr->current_payload_size);
-    return (char *)buff;
+    return buff;
 }
 
 const char *
@@ -488,11 +538,7 @@ ws_connection_age(ngx_http_request_t *r, void *data)
     return (char *)buff;
 }
 
-const char *
-local_time(ngx_http_request_t *r, void *data)
-{
-    return memcpy(buff, ngx_cached_http_time.data, ngx_cached_http_time.len);
-}
+/* Removed local_time function - using nginx native $time_local variable instead */
 
 const char *
 remote_ip(ngx_http_request_t *r, void *data)
@@ -539,13 +585,20 @@ GEN_CORE_GET_FUNC(remote_port, "remote_port")
 GEN_CORE_GET_FUNC(server_addr, "server_addr")
 GEN_CORE_GET_FUNC(server_port, "server_port")
 
+/* Native nginx time variables - more efficient than custom local_time */
+GEN_CORE_GET_FUNC(time_local, "time_local")
+GEN_CORE_GET_FUNC(time_iso8601, "time_iso8601") 
+GEN_CORE_GET_FUNC(msec, "msec")
+
 const template_variable variables[] = {
     {VAR_NAME("$ws_opcode"), sizeof("ping") - 1, ws_packet_type},
     {VAR_NAME("$ws_payload_size"), NGX_SIZE_T_LEN, ws_packet_size},
     {VAR_NAME("$ws_packet_source"), sizeof("upstream") - 1, ws_packet_source},
     {VAR_NAME("$ws_conn_age"), NGX_SIZE_T_LEN, ws_connection_age},
-    {VAR_NAME("$time_local"), sizeof("Mon, 23 Oct 2017 11:27:42 GMT") - 1,
-     local_time},
+    /* Native nginx time variables - more efficient and standard */
+    {VAR_NAME("$time_local"), sizeof("Mon, 23 Oct 2017 11:27:42 GMT") - 1, time_local},
+    {VAR_NAME("$time_iso8601"), sizeof("2017-10-23T11:27:42+00:00") - 1, time_iso8601},
+    {VAR_NAME("$msec"), sizeof("1508758062.123") - 1, msec},
     {VAR_NAME("$upstream_addr"), 60, upstream_addr},
     {VAR_NAME("$request"), 60, request},
     {VAR_NAME("$uri"), 60, uri},
@@ -694,7 +747,9 @@ complete_ws_handshake(ngx_connection_t *connection, const char *ws_key)
 
     SHA1((unsigned char *)salt, sizeof(salt) - 1, hash);
 
-    Base64Encode(hash, SHA_DIGEST_LENGTH, access_key, ACCEPT_SIZE);
+    /* Use our nginx-native base64 encoder */
+    ngx_websocket_base64_encode(connection->pool, hash, SHA_DIGEST_LENGTH, 
+                               (u_char *)access_key, ACCEPT_SIZE);
     access_key[ACCEPT_SIZE] = '\0';
     char resp[256];
     sprintf(resp, resp_template, access_key);
