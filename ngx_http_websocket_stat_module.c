@@ -214,7 +214,7 @@ ngx_http_websocket_stat_handler(ngx_http_request_t *r)
     /* Insertion in the buffer chain. */
     out.buf = b;
     out.next = NULL;
-    sprintf((char *)msg, (char *)prometheus_template, 
+    snprintf((char *)msg, sizeof(msg), (char *)prometheus_template, 
             *ngx_websocket_stat_active,
             *frames_in.frames, *frames_out.frames,
             *frames_in.total_payload_size, *frames_out.total_payload_size,
