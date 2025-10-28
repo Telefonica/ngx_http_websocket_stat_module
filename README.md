@@ -48,27 +48,91 @@ Here is a list of variables you can use in log format string:
  * $server_port - Server's port
  * $upstream_addr - websocket backend address
 
-To read websocket statistic there is GET request should be set up at "location" location of nginx config file with ws_stat command in it. Look into example section for details.
+To read websocket statistic there is GET request should be set up at "location" location of nginx config file with ws_stat command in it. The module now outputs metrics in Prometheus format by default.
+
+For scenarios where you want to append WebSocket metrics to existing content (e.g., combining with other metrics endpoints), use the `ws_stat_append` directive instead. This will add the WebSocket metrics to the end of any existing response content.
+
+Look into example section for details.
+
+## Prometheus Metrics
+
+The module exposes the following Prometheus metrics when you access the statistics endpoint:
+
+### Available Metrics
+
+* **nginx_websocket_connections_active** (gauge): Current number of active WebSocket connections
+* **nginx_websocket_frames_total** (counter): Total number of WebSocket frames processed
+  - Labels: `direction="in"` (from client) or `direction="out"` (to client)
+* **nginx_websocket_payload_bytes_total** (counter): Total WebSocket payload bytes transferred
+  - Labels: `direction="in"` (from client) or `direction="out"` (to client)
+* **nginx_websocket_tcp_bytes_total** (counter): Total TCP bytes for WebSocket connections
+  - Labels: `direction="in"` (from client) or `direction="out"` (to client)
+
+### Example Prometheus Output
+
+```
+# HELP nginx_websocket_connections_active Current number of active WebSocket connections
+# TYPE nginx_websocket_connections_active gauge
+nginx_websocket_connections_active 42
+
+# HELP nginx_websocket_frames_total Total number of WebSocket frames
+# TYPE nginx_websocket_frames_total counter
+nginx_websocket_frames_total{direction="in"} 12345
+nginx_websocket_frames_total{direction="out"} 12301
+
+# HELP nginx_websocket_payload_bytes_total Total WebSocket payload bytes
+# TYPE nginx_websocket_payload_bytes_total counter
+nginx_websocket_payload_bytes_total{direction="in"} 1048576
+nginx_websocket_payload_bytes_total{direction="out"} 2097152
+
+# HELP nginx_websocket_tcp_bytes_total Total TCP bytes for WebSocket connections
+# TYPE nginx_websocket_tcp_bytes_total counter
+nginx_websocket_tcp_bytes_total{direction="in"} 1148576
+nginx_websocket_tcp_bytes_total{direction="out"} 2197152
+```
+
+### Prometheus Configuration
+
+To scrape these metrics with Prometheus, add the following to your `prometheus.yml`:
+
+```yaml
+scrape_configs:
+  - job_name: 'nginx-websocket'
+    static_configs:
+      - targets: ['your-nginx-server:port']
+    metrics_path: '/websocket_status'  # or your configured path
+    scrape_interval: 15s
+```
 
 ## Example of configuration
 
-```
+### Standalone WebSocket Metrics Endpoint
 
-server
-{
-   ws_log <path/to/logfile>;
+```nginx
+server {
+   ws_log /var/log/nginx/websocket.log;
    ws_log_format "$time_local: packet of type $ws_opcode received from $ws_packet_source, packet size is $ws_payload_size";
    ws_log_format open "$time_local: Connection opened";
    ws_log_format close "$time_local: Connection closed";
    ws_max_connections 200;
    ws_conn_age 12h;
-# set up location for statistic
+
+   # Dedicated location for WebSocket Prometheus metrics
    location /websocket_status {
       ws_stat;
+      # This will return only WebSocket Prometheus-formatted metrics
+      # Content-Type: text/plain; version=0.0.4; charset=utf-8
    }
-   ...
-}
 
+   # Your WebSocket proxy location
+   location /websocket {
+      proxy_pass http://backend;
+      proxy_http_version 1.1;
+      proxy_set_header Upgrade $http_upgrade;
+      proxy_set_header Connection "upgrade";
+      proxy_set_header Host $host;
+   }
+}
 ```
 
 ## Copyright
