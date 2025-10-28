@@ -1,0 +1,7 @@
+server/
+test/
+nginx/
+docker-compose.yml
+LICENSE
+*.conf
+README.md

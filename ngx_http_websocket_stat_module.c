@@ -176,15 +176,27 @@ ngx_module_t ngx_http_websocket_stat_module = {
 static ngx_http_output_body_filter_pt ngx_http_next_body_filter;
 static ngx_http_output_header_filter_pt ngx_http_next_header_filter;
 
-static u_char responce_template[] =
-    "WebSocket connections: %lu\n"
-    "client websocket frames  | client websocket payload | client tcp data\n"
-    "%lu %lu %lu\n"
-    "upstream websocket frames  | upstream websocket payload | upstream tcp "
-    "data\n"
-    "%lu %lu %lu\n";
+static u_char prometheus_template[] =
+    "# HELP nginx_websocket_connections_active Current number of active WebSocket connections\n"
+    "# TYPE nginx_websocket_connections_active gauge\n"
+    "nginx_websocket_connections_active %lu\n"
+    "\n"
+    "# HELP nginx_websocket_frames_total Total number of WebSocket frames\n"
+    "# TYPE nginx_websocket_frames_total counter\n"
+    "nginx_websocket_frames_total{direction=\"in\"} %lu\n"
+    "nginx_websocket_frames_total{direction=\"out\"} %lu\n"
+    "\n"
+    "# HELP nginx_websocket_payload_bytes_total Total WebSocket payload bytes\n"
+    "# TYPE nginx_websocket_payload_bytes_total counter\n"
+    "nginx_websocket_payload_bytes_total{direction=\"in\"} %lu\n"
+    "nginx_websocket_payload_bytes_total{direction=\"out\"} %lu\n"
+    "\n"
+    "# HELP nginx_websocket_tcp_bytes_total Total TCP bytes for WebSocket connections\n"
+    "# TYPE nginx_websocket_tcp_bytes_total counter\n"
+    "nginx_websocket_tcp_bytes_total{direction=\"in\"} %lu\n"
+    "nginx_websocket_tcp_bytes_total{direction=\"out\"} %lu\n";
 
-u_char msg[sizeof(responce_template) + 6 * NGX_ATOMIC_T_LEN];
+u_char msg[sizeof(prometheus_template) + 7 * NGX_ATOMIC_T_LEN];
 
 static ngx_int_t
 ngx_http_websocket_stat_handler(ngx_http_request_t *r)
@@ -192,9 +204,9 @@ ngx_http_websocket_stat_handler(ngx_http_request_t *r)
     ngx_buf_t *b;
     ngx_chain_t out;
 
-    /* Set the Content-Type header. */
-    r->headers_out.content_type.len = sizeof("text/plain") - 1;
-    r->headers_out.content_type.data = (u_char *)"text/plain:";
+    /* Set the Content-Type header for Prometheus metrics format. */
+    r->headers_out.content_type.len = sizeof("text/plain; version=0.0.4; charset=utf-8") - 1;
+    r->headers_out.content_type.data = (u_char *)"text/plain; version=0.0.4; charset=utf-8";
 
     /* Allocate a new buffer for sending out the reply. */
     b = ngx_pcalloc(r->pool, sizeof(ngx_buf_t));
@@ -202,10 +214,11 @@ ngx_http_websocket_stat_handler(ngx_http_request_t *r)
     /* Insertion in the buffer chain. */
     out.buf = b;
     out.next = NULL;
-    sprintf((char *)msg, (char *)responce_template, *ngx_websocket_stat_active,
-            *frames_in.frames, *frames_in.total_payload_size,
-            *frames_in.total_size, *frames_out.frames,
-            *frames_out.total_payload_size, *frames_out.total_size);
+    snprintf((char *)msg, sizeof(msg), (char *)prometheus_template, 
+            *ngx_websocket_stat_active,
+            *frames_in.frames, *frames_out.frames,
+            *frames_in.total_payload_size, *frames_out.total_payload_size,
+            *frames_in.total_size, *frames_out.total_size);
 
     b->pos = msg; /* first position in memory of the data */
     b->last =
