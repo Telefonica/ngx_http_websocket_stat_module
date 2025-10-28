@@ -39,7 +39,7 @@ async def handle_client(websocket):
             logger.info(f"📤 [{timestamp}] Echo → {client_info}: {echo_message}")
 
             if message_count % 10 == 0:
-                logger.info(f"📊 Stats: {message_count} proccesed messages, {len(active_connections)} active connections")
+                logger.info(f"📊 Stats: {message_count} processed messages, {len(active_connections)} active connections")
 
     except websockets.exceptions.ConnectionClosed:
         logger.info(f"🔌 Connection closed by {client_info}")
