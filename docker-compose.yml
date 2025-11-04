@@ -1,7 +1,9 @@
 services:
   nginx:
     container_name: nginx
-    build: .
+    build: 
+      context: .
+      dockerfile: Dockerfile.debian
     ports:
       - 80:80
     configs:
