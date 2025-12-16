@@ -58,6 +58,7 @@ static ngx_int_t ngx_http_websocket_stat_init(ngx_conf_t *cf);
 
 static void *ngx_http_websocket_stat_create_main_conf(ngx_conf_t *cf);
 const char *get_core_var(ngx_http_request_t *r, const char *variable);
+static ngx_int_t ngx_http_websocket_stat_shm_init(ngx_shm_zone_t *shm_zone, void *data);
 
 static void send_close_packet(ngx_connection_t *connection, int status,
                               const char *reason);
@@ -669,32 +670,90 @@ ngx_http_ws_log_format(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     }
 }
 
-static void
-allocate_counters()
+/* Shared memory zone initialization function */
+static ngx_int_t
+ngx_http_websocket_stat_shm_init(ngx_shm_zone_t *shm_zone, void *data)
+{
+    const int cl = 128; // cache line size
+    int var_counter = 0;
+    
+    if (data) {
+        /* This is a reload - zone already exists, preserve data */
+        shm_zone->data = data;
+        ngx_log_error(NGX_LOG_NOTICE, shm_zone->shm.log, 0,
+                      "WebSocket stats: reusing existing shared memory zone, metrics preserved");
+        return NGX_OK;
+    }
+    
+    /* First initialization - configure pointers and initialize to zero */
+    frames_in.frames = (ngx_atomic_t *)(shm_zone->shm.addr + (var_counter++) * cl);
+    frames_in.total_payload_size =
+        (ngx_atomic_t *)(shm_zone->shm.addr + (var_counter++) * cl);
+    frames_in.total_size = (ngx_atomic_t *)(shm_zone->shm.addr + (var_counter++) * cl);
+    frames_out.frames = (ngx_atomic_t *)(shm_zone->shm.addr + (var_counter++) * cl);
+    frames_out.total_payload_size =
+        (ngx_atomic_t *)(shm_zone->shm.addr + (var_counter++) * cl);
+    frames_out.total_size = (ngx_atomic_t *)(shm_zone->shm.addr + (var_counter++) * cl);
+    ngx_websocket_stat_active =
+        (ngx_atomic_t *)(shm_zone->shm.addr + (var_counter++) * cl);
+    
+    /* Initialize all counters to zero only on first creation */
+    *frames_in.frames = 0;
+    *frames_in.total_payload_size = 0;
+    *frames_in.total_size = 0;
+    *frames_out.frames = 0;
+    *frames_out.total_payload_size = 0;
+    *frames_out.total_size = 0;
+    *ngx_websocket_stat_active = 0;
+    
+    /* Save pointer as data for future reinitializations */
+    shm_zone->data = (void *)shm_zone->shm.addr;
+    
+    ngx_log_error(NGX_LOG_NOTICE, shm_zone->shm.log, 0,
+                  "WebSocket stats: initialized new shared memory zone");
+    
+    return NGX_OK;
+}
+
+static ngx_int_t
+allocate_counters(ngx_conf_t *cf)
 {
     const int cl = 128; // cache line size
     const int variables = 7;
-    ngx_shm_t shm;
-    shm.size = cl * variables; //
-    shm.log = ngx_cycle->log;
-    ngx_str_set(&shm.name, "websocket_stat_shared_zone");
-    if (ngx_shm_alloc(&shm) != NGX_OK) {
-        ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
-                      "Failed to allocate shared memory");
-        return;
+    ngx_shm_zone_t *shm_zone;
+    ngx_str_t shm_name = ngx_string("websocket_stat_shared_zone");
+    
+    /* Add shared memory zone - will be preserved across reloads */
+    shm_zone = ngx_shared_memory_add(cf, &shm_name, cl * variables, 
+                                     &ngx_http_websocket_stat_module);
+    if (shm_zone == NULL) {
+        ngx_log_error(NGX_LOG_ERR, cf->log, 0,
+                      "Failed to add shared memory zone");
+        return NGX_ERROR;
     }
-    int var_counter = 0;
-    frames_in.frames = (ngx_atomic_t *)(shm.addr + (var_counter++) * cl);
-    frames_in.total_payload_size =
-        (ngx_atomic_t *)(shm.addr + (var_counter++) * cl);
-    frames_in.total_size = (ngx_atomic_t *)(shm.addr + (var_counter++) * cl);
-    frames_out.frames = (ngx_atomic_t *)(shm.addr + (var_counter++) * cl);
-    frames_out.total_payload_size =
-        (ngx_atomic_t *)(shm.addr + (var_counter++) * cl);
-    frames_out.total_size = (ngx_atomic_t *)(shm.addr + (var_counter++) * cl);
-    ngx_websocket_stat_active =
-        (ngx_atomic_t *)(shm.addr + (var_counter++) * cl);
-    assert(var_counter <= variables);
+    
+    /* Configure initialization function */
+    shm_zone->init = ngx_http_websocket_stat_shm_init;
+    
+    /* If zone already exists (reload), configure pointers from existing zone */
+    if (shm_zone->shm.exists) {
+        int var_counter = 0;
+        frames_in.frames = (ngx_atomic_t *)(shm_zone->shm.addr + (var_counter++) * cl);
+        frames_in.total_payload_size =
+            (ngx_atomic_t *)(shm_zone->shm.addr + (var_counter++) * cl);
+        frames_in.total_size = (ngx_atomic_t *)(shm_zone->shm.addr + (var_counter++) * cl);
+        frames_out.frames = (ngx_atomic_t *)(shm_zone->shm.addr + (var_counter++) * cl);
+        frames_out.total_payload_size =
+            (ngx_atomic_t *)(shm_zone->shm.addr + (var_counter++) * cl);
+        frames_out.total_size = (ngx_atomic_t *)(shm_zone->shm.addr + (var_counter++) * cl);
+        ngx_websocket_stat_active =
+            (ngx_atomic_t *)(shm_zone->shm.addr + (var_counter++) * cl);
+            
+        ngx_log_error(NGX_LOG_NOTICE, cf->log, 0,
+                      "WebSocket stats: zone exists, reconnecting to existing metrics");
+    }
+    
+    return NGX_OK;
 }
 
 static ngx_table_elt_t *
@@ -781,7 +840,7 @@ ngx_http_websocket_request_handler(ngx_http_request_t *r)
     }
 
     if (conf->max_ws_connections > 0 &&
-        conf->max_ws_connections == (int)*ngx_websocket_stat_active) {
+        (int)*ngx_websocket_stat_active >= conf->max_ws_connections) {
         ngx_table_elt_t *upgrade_hdr = find_header_in(r, "Upgrade");
         if (!upgrade_hdr ||
             strcasecmp((char *)upgrade_hdr->value.data, "websocket") != 0) {
@@ -803,7 +862,9 @@ ngx_http_websocket_request_handler(ngx_http_request_t *r)
 static ngx_int_t
 ngx_http_websocket_stat_init(ngx_conf_t *cf)
 {
-    allocate_counters();
+    if (allocate_counters(cf) != NGX_OK) {
+        return NGX_ERROR;
+    }
 
     ngx_http_next_header_filter = ngx_http_top_header_filter;
     ngx_http_top_header_filter = ngx_http_websocket_stat_header_filter;
